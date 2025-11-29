@@ -100,6 +100,26 @@ jobs:
           echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "release_commit=${pr_head_sha}" >> "$GITHUB_OUTPUT"
 
+      - name: Extract branch metadata and project version
+        id: extract_metadata
+        run: |
+          set -euo pipefail
+          ARCHIVE_JSON="${{ steps.identify_pr_and_artifact.outputs.result }}"
+          echo "$ARCHIVE_JSON" > /tmp/art.json
+          pr_head_ref=$(jq -r '.pr_head_ref' /tmp/art.json)
+          # parse branch name like: "fix - 123 - description" or "fix-123-description"
+          IFS='-' read -r p1 p2 _ <<< "$pr_head_ref"
+          branch_type=$(echo "$p1" | tr '[:upper:]' '[:lower:]' | sed 's/ //g')
+          story_id=$(echo "$p2" | sed 's/[^A-Za-z0-9]//g')
+          # get project version via mvn (maven should be available); fallback to parsing pom.xml
+          project_version=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.1.0:exec || true)
+          if [ -z "$project_version" ]; then
+            project_version=$(grep -m1 -oP '(?<=<version>)[^<]+' pom.xml || echo "unknown")
+          fi
+          echo "branch_type=${branch_type}" >> "$GITHUB_OUTPUT"
+          echo "story_id=${story_id}" >> "$GITHUB_OUTPUT"
+          echo "project_version=${project_version}" >> "$GITHUB_OUTPUT"
+
       - name: Create/force-update git tag for branch
         if: ${{ steps.set_release_tag.outputs.skip != 'true' }}
         run: |
@@ -184,7 +204,11 @@ jobs:
             const pr_number = identify.pr_number;
             const pr_user = identify.pr_user_login || '';
             const pr_head_ref = identify.pr_head_ref || '';
-            const body = `Official release created from merged PR #${pr_number} by ${pr_user}.\nBranch-based single release for branch ${pr_head_ref} (this release will overwrite previous release for the branch).`;
+            const body = `Official release created from merged PR #${pr_number} by ${pr_user}.
+Branch-based single release for branch ${pr_head_ref} (this release will overwrite previous release for the branch).`;
+            const branch_type = process.env.BRANCH_TYPE || '';
+            const story_id = process.env.STORY_ID || '';
+            const project_version = process.env.PROJECT_VERSION || '';
 
             // Get or create release by tag
             let release;
@@ -224,25 +248,36 @@ jobs:
               core.info(`No artifacts directory found at ${artifactsDir}`);
             }
 
-            // Add label to the merged PR (create label if missing)
+            // Add labels to the merged PR (create labels if missing): released:<branch>, type:<fix|feature>, version:<version>
             if (pr_number) {
               const sanitized = (pr_head_ref || 'branch').replace(/\//g, '-');
-              const labelName = `released:${sanitized}`;
-              try {
-                await github.rest.issues.getLabel({ owner, repo, name: labelName });
-                core.info(`Label ${labelName} exists`);
-              } catch (e) {
-                if (e.status === 404) {
-                  core.info(`Creating label ${labelName}`);
-                  await github.rest.issues.createLabel({ owner, repo, name: labelName, color: '0E8A16', description: 'Automatically created release label' });
-                } else {
-                  throw e;
+              const releasedLabel = `released:${sanitized}`;
+              const typeLabel = branch_type ? `type:${branch_type}` : null;
+              const versionLabel = project_version ? `version:${project_version}` : null;
+              const labelsToEnsure = [releasedLabel];
+              if (typeLabel) labelsToEnsure.push(typeLabel);
+              if (versionLabel) labelsToEnsure.push(versionLabel);
+
+              for (const lbl of labelsToEnsure) {
+                try {
+                  await github.rest.issues.getLabel({ owner, repo, name: lbl });
+                  core.info(`Label ${lbl} exists`);
+                } catch (e) {
+                  if (e.status === 404) {
+                    core.info(`Creating label ${lbl}`);
+                    await github.rest.issues.createLabel({ owner, repo, name: lbl, color: '0E8A16', description: 'Automatically created release label' });
+                  } else {
+                    throw e;
+                  }
                 }
               }
-              core.info(`Adding label ${labelName} to PR #${pr_number}`);
-              await github.rest.issues.addLabels({ owner, repo, issue_number: pr_number, labels: [labelName] });
+              core.info(`Adding labels ${labelsToEnsure.join(', ')} to PR #${pr_number}`);
+              await github.rest.issues.addLabels({ owner, repo, issue_number: pr_number, labels: labelsToEnsure });
             }
             return { release_id: release.data.id };
         env:
           RELEASE_TAG: ${{ steps.set_release_tag.outputs.release_tag }}
           IDENTIFY_RESULT: ${{ steps.identify_pr_and_artifact.outputs.result }}
+          PROJECT_VERSION: ${{ steps.extract_metadata.outputs.project_version }}
+          BRANCH_TYPE: ${{ steps.extract_metadata.outputs.branch_type }}
+          STORY_ID: ${{ steps.extract_metadata.outputs.story_id }}
