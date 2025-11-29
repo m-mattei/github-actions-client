@@ -51,3 +51,11 @@ jobs:
           path: |
             target/*.jar
             target/surefire-reports/**
+
+      - name: Verify uploaded artifacts via GitHub API (diagnostic)
+        run: |
+          set -euo pipefail
+          echo "Listing artifacts for this run ($GITHUB_RUN_ID) via API"
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" | jq -r '.artifacts[] | "id:\(.id) name:\(.name) size:\(.size_in_bytes) expires_at:\(.expired)"' || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
