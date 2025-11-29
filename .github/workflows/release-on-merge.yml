@@ -1,8 +1,11 @@
 name: Release on merged PR to main
 
 on:
-  pull_request:
-    types: [closed]
+  workflow_run:
+    workflows:
+      - "Java CI"
+    types:
+      - completed
 
 permissions:
   contents: write
@@ -10,124 +13,135 @@ permissions:
 
 jobs:
   release:
-    # only run when PR was merged into main
-    if: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
 
-      - name: Set up JDK
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Cache Maven local repository
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-m2-
-
-      - id: find_java_ci_run_and_artifact
-        name: Find Java CI workflow run and artifact for the merge commit
-        uses: actions/github-script@v5
+      - name: Identify merged PR and artifact from triggering Java CI run
+        id: identify_pr
+        uses: actions/github-script@v8
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            // prefer the merge commit sha, fall back to PR head SHA
-            const sha = process.env.MERGE_SHA || context.payload.pull_request.head.sha;
-            core.info(`Looking for Java CI run for SHA: ${sha}`);
-            // list recent workflow runs for the repo and find one with matching sha and name 'Java CI'
-            const runsResp = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, per_page: 100 });
-            const runs = runsResp.data.workflow_runs || [];
-            const run = runs.find(r => r.head_sha === sha && r.name === 'Java CI');
-            if (!run) {
-              throw new Error(`No 'Java CI' workflow run found for commit ${sha}`);
+            const run = context.payload.workflow_run;
+            const runId = run.id;
+            const headSha = run.head_sha;
+            core.info(`Triggered by Java CI run id=${runId} head_sha=${headSha}`);
+
+            // Find PRs associated with this commit
+            const prsResp = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: headSha });
+            const prs = prsResp.data || [];
+            core.info(`Found ${prs.length} PR(s) associated with commit ${headSha}`);
+
+            // Find a merged PR that targeted main
+            let mergedPr = null;
+            for (const p of prs) {
+              const prDetails = await github.rest.pulls.get({ owner, repo, pull_number: p.number });
+              if (prDetails.data && prDetails.data.base && prDetails.data.base.ref === 'main' && prDetails.data.merged === true) {
+                mergedPr = prDetails.data;
+                break;
+              }
             }
-            core.info(`Found Java CI run id=${run.id} status=${run.conclusion}`);
-            // get artifacts for that run
-            const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id });
+
+            if (!mergedPr) {
+              core.info('No merged PR into main associated with this run; nothing to do.');
+              return { skip: true };
+            }
+
+            core.info(`Found merged PR #${mergedPr.number} (head ref=${mergedPr.head.ref}, head sha=${mergedPr.head.sha})`);
+
+            // Get artifacts for this run
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: runId });
+            if (!arts || !arts.data || !Array.isArray(arts.data.artifacts) || arts.data.artifacts.length === 0) {
+              throw new Error(`No artifacts found for Java CI run ${runId}`);
+            }
             const artifact = arts.data.artifacts.find(a => a.name === 'build-artifacts') || arts.data.artifacts[0];
-            if (!artifact) {
-              throw new Error(`No artifacts found for run ${run.id}`);
-            }
-            core.info(`Found artifact: ${artifact.name} (id=${artifact.id})`);
-            // return the archive download url and run id
-            return { archive_url: artifact.archive_download_url, run_id: run.id };
-        env:
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
 
-      - name: Download and extract Java CI artifact
+            return {
+              archive_url: artifact.archive_download_url,
+              run_id: runId,
+              pr_number: mergedPr.number,
+              pr_user_login: mergedPr.user ? mergedPr.user.login : '',
+              pr_head_ref: mergedPr.head.ref,
+              pr_head_sha: mergedPr.head.sha
+            };
+
+      - name: Compute branch tag and commit
+        id: set_tag
         run: |
           set -euo pipefail
-          ARCHIVE_JSON="${{ steps.find_java_ci_run_and_artifact.outputs.result }}"
-          echo "$ARCHIVE_JSON" > /tmp/art.json
-          archive_url=$(jq -r '.archive_url' /tmp/art.json)
-          if [ -z "$archive_url" ] || [ "$archive_url" = "null" ]; then
-            echo "No archive_url found in previous step output" >&2
-            cat /tmp/art.json >&2 || true
-            exit 1
+          IDENT="${{ steps.identify_pr.outputs.result }}"
+          if [ -z "$IDENT" ] || [ "$IDENT" = "null" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          mkdir -p downloaded-artifacts
-          echo "Downloading artifact from: $archive_url"
-          curl -L -H "Authorization: Bearer $GITHUB_TOKEN" -o /tmp/artifact.zip "$archive_url"
-          unzip -o /tmp/artifact.zip -d downloaded-artifacts
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          pr_head_ref=$(echo "$IDENT" | jq -r '.pr_head_ref')
+          pr_head_sha=$(echo "$IDENT" | jq -r '.pr_head_sha')
+          sanitized=${pr_head_ref//\//-}
+          tag="branch-${sanitized}"
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release_commit=$pr_head_sha" >> "$GITHUB_OUTPUT"
 
-      - id: determine_tag
-        name: Determine tag name from POM or fallback
+      - name: Extract metadata (branch type/story id and project version)
+        id: metadata
         run: |
           set -euo pipefail
-          version="$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.1.0:exec || true)"
-          echo "POM version: ${version}"
-          if [ -n "$version" ] && [[ "$version" != *SNAPSHOT* ]]; then
-            tag="v${version}"
-          elif [ -n "$version" ]; then
-            release_version="${version%-SNAPSHOT}"
-            tag="v${release_version}-${GITHUB_RUN_NUMBER}"
-          else
-            tag="v$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+          IDENT="${{ steps.identify_pr.outputs.result }}"
+          pr_head_ref=$(echo "$IDENT" | jq -r '.pr_head_ref')
+          # try patterns like "fix - 123 - description" or "fix-123-description" or "fix/123-desc"
+          branch_name=$(echo "$pr_head_ref" | sed 's/^\s*//;s/\s*$//')
+          # normalize separators to hyphen then split
+          norm=$(echo "$branch_name" | sed 's#[/_]#-#g')
+          IFS='-' read -r part1 part2 _ <<< "$norm"
+          branch_type=$(echo "$part1" | tr '[:upper:]' '[:lower:]' | sed 's/ //g')
+          story_id=$(echo "$part2" | sed 's/[^A-Za-z0-9]//g')
+          # get project version
+          project_version=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.1.0:exec || true)
+          if [ -z "$project_version" ]; then
+            project_version=$(grep -m1 -oP '(?<=<version>)[^<]+' pom.xml || echo "unknown")
           fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "branch_type=$branch_type" >> "$GITHUB_OUTPUT"
+          echo "story_id=$story_id" >> "$GITHUB_OUTPUT"
+          echo "project_version=$project_version" >> "$GITHUB_OUTPUT"
 
-      - name: Create and push tag
+      - name: Create/force-update branch tag
+        if: ${{ steps.set_tag.outputs.release_tag != '' }}
         run: |
           set -euo pipefail
           git config user.name "${GITHUB_ACTOR}"
           git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
-          git tag -a "${{ steps.determine_tag.outputs.tag }}" -m "Release ${{ steps.determine_tag.outputs.tag }}"
-          git push origin "${{ steps.determine_tag.outputs.tag }}"
-
-      - name: Configure Maven settings for GitHub Packages
-        run: |
-          mkdir -p $HOME/.m2
-          cat > $HOME/.m2/settings.xml <<'SETTINGS'
-          <settings>
-            <servers>
-              <server>
-                <id>github</id>
-                <username>${env.GITHUB_ACTOR}</username>
-                <password>${env.GITHUB_TOKEN}</password>
-              </server>
-            </servers>
-          </settings>
-          SETTINGS
+          tag="${{ steps.set_tag.outputs.release_tag }}"
+          commit="${{ steps.set_tag.outputs.release_commit }}"
+          git tag -f "$tag" "$commit"
+          git push -f origin "refs/tags/$tag"
         env:
           GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish JAR(s) to GitHub Packages (Maven) using deploy-file
+      - name: Download artifact archive and extract
         run: |
           set -euo pipefail
-          repo_url="https://maven.pkg.github.com/m-mattei/github-actions-client"
+          IDENT="${{ steps.identify_pr.outputs.result }}"
+          archive_url=$(echo "$IDENT" | jq -r '.archive_url')
+          if [ -z "$archive_url" ] || [ "$archive_url" = "null" ]; then
+            echo "No archive URL found" >&2
+            exit 1
+          fi
+          mkdir -p downloaded-artifacts
+          curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" -o /tmp/artifact.zip "$archive_url"
+          unzip -o /tmp/artifact.zip -d downloaded-artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish JAR(s) to GitHub Packages (Maven)
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          repo_url="https://maven.pkg.github.com/${{ github.repository }}"
           for jar in downloaded-artifacts/target/*.jar; do
             echo "Publishing $jar to $repo_url"
             mvn -B org.apache.maven.plugins:maven-deploy-plugin:3.0.0:deploy-file \
@@ -137,15 +151,25 @@ jobs:
               -Durl="$repo_url"
           done
 
-      - name: Create official release
-        uses: ncipollo/release-action@v1
+      - name: Create or update release, upload assets and add labels
+        uses: actions/github-script@v8
         with:
-          tag: ${{ steps.determine_tag.outputs.tag }}
-          name: Release ${{ steps.determine_tag.outputs.tag }}
-          body: |
-            Official release created from merged PR #${{ github.event.pull_request.number }} by ${{ github.event.pull_request.user.login }}.
-            Artifacts were pulled from the successful Java CI run for the merge commit.
-          prerelease: false
-          files: downloaded-artifacts/target/*.jar
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.RELEASE_TAG;
+            const identify = JSON.parse(process.env.IDENTIFY_JSON || '{}');
+            const pr_number = identify.pr_number;
+            const pr_user = identify.pr_user_login || '';
+            const pr_head_ref = identify.pr_head_ref || '';
+            const branch_type = process.env.BRANCH_TYPE || '';
+            const project_version = process.env.PROJECT_VERSION || '';
+            const body = `Official release created from merged PR #${pr_number} by ${pr_user}.\nBranch-based single release for branch ${pr_head_ref} (this release will overwrite previous release for the branch).`;
+
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              core.info(`Found existing release id=${release.data.id} for tag=${tag}`);
+              await github.rest.repos.updateRelease({ owner, repo, release_id: release.data.id, tag_name: tag, name: `Release ${tag}`, body,

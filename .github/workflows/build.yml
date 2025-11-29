@@ -2,6 +2,7 @@ name: Java CI
 
 on:
   push: {}
+  pull_request: {}
   workflow_dispatch: {}
 
 jobs:
@@ -29,6 +30,20 @@ jobs:
       - name: Build with Maven
         run: mvn -B package
 
+      - name: Print workflow/run identifiers (diagnostic)
+        run: |
+          echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
+          echo "GITHUB_RUN_NUMBER=$GITHUB_RUN_NUMBER"
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "Run URL: https://github.com/${{ github.repository }}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: List build output (diagnostic)
+        run: |
+          echo "Listing target/ before uploading artifacts"
+          ls -l target || true
+          ls -l target/surefire-reports || true
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v5
         with:
@@ -36,3 +51,37 @@ jobs:
           path: |
             target/*.jar
             target/surefire-reports/**
+
+      - name: Verify uploaded artifacts via GitHub API (diagnostic)
+        run: |
+          set -euo pipefail
+          echo "Listing artifacts for this run ($GITHUB_RUN_ID) via API"
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" | jq -r '.artifacts[] | "id:\(.id) name:\(.name) size:\(.size_in_bytes) expires_at:\(.expired)"' || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dispatch prerelease workflow (repository_dispatch)
+        if: ${{ always() }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runId = process.env.GITHUB_RUN_ID;
+            core.info(`Checking artifacts for run ${runId}`);
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: runId });
+            const found = (arts && arts.data && Array.isArray(arts.data.artifacts)) ? arts.data.artifacts.find(a => a.name === 'build-artifacts') : null;
+            if (!found) {
+              core.info('No build-artifacts found; will still dispatch but prerelease may fail if artifact unavailable');
+            } else {
+              core.info(`Found build-artifacts id=${found.id}`);
+            }
+            const payload = {
+              run_id: runId,
+              head_branch: (process.env.GITHUB_REF || '').replace('refs/heads/',''),
+              head_sha: process.env.GITHUB_SHA || ''
+            };
+            core.info(`Dispatching repository event build-artifact-ready with payload: ${JSON.stringify(payload)}`);
+            await github.rest.repos.createDispatchEvent({ owner, repo, event_type: 'build-artifact-ready', client_payload: payload });
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
