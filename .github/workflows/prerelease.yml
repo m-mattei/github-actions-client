@@ -1,19 +1,16 @@
-name: Create prerelease on push
+name: Create prerelease on build artifact ready
 
 on:
-  workflow_run:
-    workflows:
-      - "Java CI"
-    types:
-      - completed
+  repository_dispatch:
+    types: [build-artifact-ready]
 
 permissions:
   contents: write
 
 jobs:
   create-prerelease:
-    # only run when the upstream workflow (Java CI) completed successfully
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # triggered by repository_dispatch from the build workflow (client_payload.run_id required)
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload && github.event.client_payload.run_id }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -25,17 +22,18 @@ jobs:
       # No build environment needed here — prerelease downloads artifacts from Java CI
 
       - id: vars
-        name: Set short SHA and branch
+        name: Set short SHA and branch (from dispatch payload)
         run: |
-          # short SHA
-          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          # sanitized branch name (github.ref_name is available in newer runners, fall back to parsing GITHUB_REF)
-          if [ -n "${GITHUB_REF_NAME}" ]; then
+          # prefer client payload values from repository_dispatch
+          short_sha="${GITHUB_SHA::7}"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          if [ -n "${{ github.event.client_payload.head_branch }}" ]; then
+            branch="${{ github.event.client_payload.head_branch }}"
+          elif [ -n "${GITHUB_REF_NAME}" ]; then
             branch=${GITHUB_REF_NAME}
           else
             branch=${GITHUB_REF#refs/heads/}
           fi
-          # replace slashes with dashes for tag safety
           branch_sanitized=${branch//\//-}
           echo "branch=${branch_sanitized}" >> "$GITHUB_OUTPUT"
 
@@ -43,9 +41,9 @@ jobs:
         id: set_release_tag
         run: |
           set -euo pipefail
-          # Get head branch and SHA from workflow_run payload
-          head_branch="${{ github.event.workflow_run.head_branch }}"
-          head_sha="${{ github.event.workflow_run.head_sha }}"
+          # Get head branch and SHA from the dispatch client_payload
+          head_branch="${{ github.event.client_payload.head_branch }}"
+          head_sha="${{ github.event.client_payload.head_sha }}"
           if [ -z "$head_branch" ]; then
             echo "Error: unable to determine head branch from workflow_run" >&2
             exit 1
@@ -100,44 +98,14 @@ jobs:
             echo "downloaded=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Wait for build artifact availability (polling)
-        if: ${{ steps.check_download.outputs.downloaded == 'false' }}
-        run: |
-          set -euo pipefail
-          echo "Waiting for 'build-artifacts' to appear for workflow_run id=${{ github.event.workflow_run.id }}"
-          max_attempts=12
-          attempt=0
-          found=false
-          while [ $attempt -lt $max_attempts ]; do
-            attempt=$((attempt + 1))
-            echo "Attempt $attempt/${max_attempts}..."
-            artifacts_json=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${{ github.event.workflow_run.id }}/artifacts") || artifacts_json=""
-            if [ -n "$artifacts_json" ]; then
-              has=$(echo "$artifacts_json" | jq -r '.artifacts[].name' 2>/dev/null | grep -Fx "build-artifacts" || true)
-              if [ -n "$has" ]; then
-                echo "Found build-artifacts"
-                found=true
-                break
-              fi
-            fi
-            sleep 10
-          done
-          if [ "$found" != "true" ]; then
-            echo "Timed out waiting for build-artifacts to be available (checked ${max_attempts} times)." >&2
-            exit 1
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Download build artifacts from triggering Java CI run
-        if: ${{ steps.check_download.outputs.downloaded == 'false' }}
-        id: download_action_after_wait
+        id: download_action
         uses: actions/download-artifact@v6
         with:
           name: build-artifacts
           path: downloaded-artifacts
           repository: ${{ github.repository }}
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ github.event.client_payload.run_id }}
         continue-on-error: true
 
       - id: fallback_identify
@@ -148,8 +116,8 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const run = context.payload.workflow_run;
-            const runId = run.id;
+            const runId = context.payload && context.payload.client_payload ? context.payload.client_payload.run_id : undefined;
+            if (!runId) throw new Error('No run_id found in repository_dispatch client_payload');
             core.info(`Looking for artifacts on Java CI run id=${runId}`);
             const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: runId });
             if (!arts || !arts.data || !arts.data.artifacts || arts.data.artifacts.length === 0) {
