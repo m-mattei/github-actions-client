@@ -1,8 +1,11 @@
 name: Release on merged PR to main
 
 on:
-  pull_request:
-    types: [closed]
+  workflow_run:
+    workflows:
+      - "Java CI"
+    types:
+      - completed
 
 permissions:
   contents: write
@@ -10,8 +13,8 @@ permissions:
 
 jobs:
   release:
-    # only run when PR was merged into main
-    if: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+    # only run when the triggering Java CI workflow run concluded successfully
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -34,71 +37,58 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-m2-
 
-      - id: find_java_ci_run_and_artifact
-        name: Find Java CI workflow run and artifact for the merge commit
+      - id: identify_pr_and_artifact
+        name: Ensure this run corresponds to a merged PR into main and return artifact
         uses: actions/github-script@v5
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const preferSha = process.env.MERGE_SHA || context.payload.pull_request.head.sha;
-            core.info(`Looking for Java CI run for preferred SHA: ${preferSha}`);
+            const run = context.payload.workflow_run;
+            const runId = run.id;
+            const headSha = run.head_sha;
+            core.info(`Triggered by Java CI run id=${runId} head_sha=${headSha}`);
 
-            // Fetch recent Java CI runs
-            const runsResp = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, per_page: 100 });
-            const runs = (runsResp.data.workflow_runs || []).filter(r => r.name === 'Java CI');
+            // Find PRs associated with this commit
+            const prsResp = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: headSha });
+            const prs = prsResp.data || [];
+            core.info(`Found ${prs.length} PR(s) associated with commit ${headSha}`);
 
-            // helper to check a run for the artifact
-            async function findArtifactInRun(run) {
-              const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id });
-              if (!arts || !arts.data || !arts.data.artifacts) return null;
-              // prefer artifact named 'build-artifacts'
-              const artifact = arts.data.artifacts.find(a => a.name === 'build-artifacts') || arts.data.artifacts[0];
-              return artifact || null;
-            }
-
-            // 1) prefer run where head_sha == preferSha
-            let chosen = null;
-            for (const r of runs) {
-              if (r.head_sha === preferSha) {
-                const art = await findArtifactInRun(r);
-                if (art) { chosen = { run: r, artifact: art }; break; }
+            // Look for a PR that targets main and is merged
+            let mergedPr = null;
+            for (const p of prs) {
+              const prDetails = await github.rest.pulls.get({ owner, repo, pull_number: p.number });
+              if (prDetails.data.base && prDetails.data.base.ref === 'main' && prDetails.data.merged === true) {
+                mergedPr = prDetails.data;
+                break;
               }
             }
 
-            // 2) fallback to PR head SHA
-            if (!chosen && context.payload.pull_request && context.payload.pull_request.head) {
-              const headSha = context.payload.pull_request.head.sha;
-              for (const r of runs) {
-                if (r.head_sha === headSha) {
-                  const art = await findArtifactInRun(r);
-                  if (art) { chosen = { run: r, artifact: art }; break; }
-                }
-              }
+            if (!mergedPr) {
+              core.info('No merged PR into main associated with this run; skipping release.');
+              return { skip: 'true' };
             }
 
-            // 3) fallback: any recent successful run with artifacts
-            if (!chosen) {
-              for (const r of runs) {
-                if (r.conclusion && r.conclusion !== 'success') continue;
-                const art = await findArtifactInRun(r);
-                if (art) { chosen = { run: r, artifact: art }; break; }
-              }
-            }
+            core.info(`Found merged PR #${mergedPr.number} into main (merged_at=${mergedPr.merged_at})`);
 
-            if (!chosen) {
-              throw new Error(`Unable to find build-artifacts in recent Java CI runs for PR #${context.payload.pull_request.number}`);
+            // Get artifacts for the triggering run
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: runId });
+            if (!arts || !arts.data || !arts.data.artifacts || arts.data.artifacts.length === 0) {
+              throw new Error(`No artifacts found for Java CI run ${runId}`);
             }
-
-            core.info(`Selected run id=${chosen.run.id} head_sha=${chosen.run.head_sha} artifact=${chosen.artifact.name}`);
-            return { archive_url: chosen.artifact.archive_download_url, run_id: chosen.run.id };
-        env:
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+            const artifact = arts.data.artifacts.find(a => a.name === 'build-artifacts') || arts.data.artifacts[0];
+            core.info(`Selected artifact ${artifact.name} (id=${artifact.id}) from run ${runId}`);
+            return { archive_url: artifact.archive_download_url, run_id: runId, pr_number: mergedPr.number, pr_user_login: mergedPr.user.login };
 
       - name: Download and extract Java CI artifact
         run: |
           set -euo pipefail
-          ARCHIVE_JSON="${{ steps.find_java_ci_run_and_artifact.outputs.result }}"
+          ARCHIVE_JSON="${{ steps.identify_pr_and_artifact.outputs.result }}"
+          skip=$(echo "$ARCHIVE_JSON" | jq -r '.skip // empty') || true
+          if [ "$skip" = "true" ]; then
+            echo "No merged PR into main associated with this run; skipping release.";
+            exit 0
+          fi
           echo "$ARCHIVE_JSON" > /tmp/art.json
           archive_url=$(jq -r '.archive_url' /tmp/art.json)
           if [ -z "$archive_url" ] || [ "$archive_url" = "null" ]; then
@@ -174,7 +164,7 @@ jobs:
           tag: ${{ steps.determine_tag.outputs.tag }}
           name: Release ${{ steps.determine_tag.outputs.tag }}
           body: |
-            Official release created from merged PR #${{ github.event.pull_request.number }} by ${{ github.event.pull_request.user.login }}.
+            Official release created from merged PR #${{ fromJSON(steps.identify_pr_and_artifact.outputs.result).pr_number }} by ${{ fromJSON(steps.identify_pr_and_artifact.outputs.result).pr_user_login }}.
             Artifacts were pulled from the successful Java CI run for the merge commit.
           prerelease: false
           files: downloaded-artifacts/target/*.jar
