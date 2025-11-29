@@ -1,0 +1,151 @@
+name: Release on merged PR to main
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    # only run when PR was merged into main
+    if: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Maven local repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2-
+
+      - id: find_java_ci_run_and_artifact
+        name: Find Java CI workflow run and artifact for the merge commit
+        uses: actions/github-script@v5
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            // prefer the merge commit sha, fall back to PR head SHA
+            const sha = process.env.MERGE_SHA || context.payload.pull_request.head.sha;
+            core.info(`Looking for Java CI run for SHA: ${sha}`);
+            // list recent workflow runs for the repo and find one with matching sha and name 'Java CI'
+            const runsResp = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, per_page: 100 });
+            const runs = runsResp.data.workflow_runs || [];
+            const run = runs.find(r => r.head_sha === sha && r.name === 'Java CI');
+            if (!run) {
+              throw new Error(`No 'Java CI' workflow run found for commit ${sha}`);
+            }
+            core.info(`Found Java CI run id=${run.id} status=${run.conclusion}`);
+            // get artifacts for that run
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id });
+            const artifact = arts.data.artifacts.find(a => a.name === 'build-artifacts') || arts.data.artifacts[0];
+            if (!artifact) {
+              throw new Error(`No artifacts found for run ${run.id}`);
+            }
+            core.info(`Found artifact: ${artifact.name} (id=${artifact.id})`);
+            // return the archive download url and run id
+            return { archive_url: artifact.archive_download_url, run_id: run.id };
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Download and extract Java CI artifact
+        run: |
+          set -euo pipefail
+          ARCHIVE_JSON="${{ steps.find_java_ci_run_and_artifact.outputs.result }}"
+          echo "$ARCHIVE_JSON" > /tmp/art.json
+          archive_url=$(jq -r '.archive_url' /tmp/art.json)
+          if [ -z "$archive_url" ] || [ "$archive_url" = "null" ]; then
+            echo "No archive_url found in previous step output" >&2
+            cat /tmp/art.json >&2 || true
+            exit 1
+          fi
+          mkdir -p downloaded-artifacts
+          echo "Downloading artifact from: $archive_url"
+          curl -L -H "Authorization: Bearer $GITHUB_TOKEN" -o /tmp/artifact.zip "$archive_url"
+          unzip -o /tmp/artifact.zip -d downloaded-artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: determine_tag
+        name: Determine tag name from POM or fallback
+        run: |
+          set -euo pipefail
+          version="$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.1.0:exec || true)"
+          echo "POM version: ${version}"
+          if [ -n "$version" ] && [[ "$version" != *SNAPSHOT* ]]; then
+            tag="v${version}"
+          elif [ -n "$version" ]; then
+            release_version="${version%-SNAPSHOT}"
+            tag="v${release_version}-${GITHUB_RUN_NUMBER}"
+          else
+            tag="v$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        run: |
+          set -euo pipefail
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          git tag -a "${{ steps.determine_tag.outputs.tag }}" -m "Release ${{ steps.determine_tag.outputs.tag }}"
+          git push origin "${{ steps.determine_tag.outputs.tag }}"
+
+      - name: Configure Maven settings for GitHub Packages
+        run: |
+          mkdir -p $HOME/.m2
+          cat > $HOME/.m2/settings.xml <<'SETTINGS'
+          <settings>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${env.GITHUB_ACTOR}</username>
+                <password>${env.GITHUB_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          SETTINGS
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish JAR(s) to GitHub Packages (Maven) using deploy-file
+        run: |
+          set -euo pipefail
+          repo_url="https://maven.pkg.github.com/m-mattei/github-actions-client"
+          for jar in downloaded-artifacts/target/*.jar; do
+            echo "Publishing $jar to $repo_url"
+            mvn -B org.apache.maven.plugins:maven-deploy-plugin:3.0.0:deploy-file \
+              -Dfile="$jar" \
+              -DpomFile=pom.xml \
+              -DrepositoryId=github \
+              -Durl="$repo_url"
+          done
+
+      - name: Create official release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.determine_tag.outputs.tag }}
+          name: Release ${{ steps.determine_tag.outputs.tag }}
+          body: |
+            Official release created from merged PR #${{ github.event.pull_request.number }} by ${{ github.event.pull_request.user.login }}.
+            Artifacts were pulled from the successful Java CI run for the merge commit.
+          prerelease: false
+          files: downloaded-artifacts/target/*.jar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

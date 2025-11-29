@@ -1,52 +1,118 @@
 name: Create prerelease on push
 
 on:
-  push:
-    # trigger on pushes to any branch
-    branches:
-      - '**'
+  workflow_run:
+    workflows:
+      - "Java CI"
+    types:
+      - completed
 
 permissions:
   contents: write
 
 jobs:
   create-prerelease:
+    # only run when the upstream workflow (Java CI) completed successfully
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Set up Java
-        uses: actions/setup-java@v5
         with:
-          distribution: temurin
-          java-version: '11'
+          # need full history to compute commit ranges and previous tags
+          fetch-depth: 0
 
-      - name: Cache Maven local repository
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-m2-
-
-      - name: Build with Maven
-        run: mvn -B package
+      # No build environment needed here — prerelease downloads artifacts from Java CI
 
       - id: vars
-        name: Set short SHA
-        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        name: Set short SHA and branch
+        run: |
+          # short SHA
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          # sanitized branch name (github.ref_name is available in newer runners, fall back to parsing GITHUB_REF)
+          if [ -n "${GITHUB_REF_NAME}" ]; then
+            branch=${GITHUB_REF_NAME}
+          else
+            branch=${GITHUB_REF#refs/heads/}
+          fi
+          # replace slashes with dashes for tag safety
+          branch_sanitized=${branch//\//-}
+          echo "branch=${branch_sanitized}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts from Java CI run
+        uses: actions/download-artifact@v6
+        with:
+          name: build-artifacts
+          path: downloaded-artifacts
+
+      - name: List downloaded artifacts
+        run: |
+          echo "Downloaded files:" && ls -R downloaded-artifacts || true
+
+      - name: Check for built JAR(s)
+        run: |
+          set -euo pipefail
+          if [ -z "$(ls downloaded-artifacts/target/*.jar 2>/dev/null)" ]; then
+            echo "Error: No JAR files found in downloaded-artifacts/target/*.jar" >&2
+            echo "Make sure the 'Java CI' workflow uploaded artifacts named 'build-artifacts' that include target/*.jar" >&2
+            exit 1
+          fi
+          echo "Found JAR(s):" && ls downloaded-artifacts/target/*.jar
+
+      - id: tests
+        name: Summarize test results
+        run: |
+          set -euo pipefail
+          summary=""
+          reports_dir=downloaded-artifacts/target/surefire-reports
+          if [ ! -d "$reports_dir" ] || [ -z "$(ls "$reports_dir"/TEST-*.xml 2>/dev/null)" ]; then
+            summary="No test reports found."
+          else
+            total=0; failures=0; errors=0; skipped=0
+            for f in "$reports_dir"/TEST-*.xml; do
+              t=$(sed -n 's/.*tests="\([0-9]*\)".*/\1/p' "$f" | head -n1 || echo 0)
+              fa=$(sed -n 's/.*failures="\([0-9]*\)".*/\1/p' "$f" | head -n1 || echo 0)
+              er=$(sed -n 's/.*errors="\([0-9]*\)".*/\1/p' "$f" | head -n1 || echo 0)
+              sk=$(sed -n 's/.*skipped="\([0-9]*\)".*/\1/p' "$f" | head -n1 || echo 0)
+              total=$((total + t))
+              failures=$((failures + fa))
+              errors=$((errors + er))
+              skipped=$((skipped + sk))
+            done
+            summary="Tests: ${total}, Failures: ${failures}, Errors: ${errors}, Skipped: ${skipped}"
+          fi
+          echo "test_summary=${summary}" >> "$GITHUB_OUTPUT"
+
+      - id: notes
+        name: Generate release notes from commits and tests
+        run: |
+          set -euo pipefail
+          test_summary="${{ steps.tests.outputs.test_summary }}"
+          # If the push event doesn't have a valid before ref (initial commit), fallback to last 50 commits
+          if [ "${GITHUB_EVENT_BEFORE}" = "0000000000000000000000000000000000000000" ] || ! git rev-parse --verify "${GITHUB_EVENT_BEFORE}" >/dev/null 2>&1; then
+            commits=$(git log --pretty=format:'- %s (%h) by %an' -n 50)
+          else
+            commits=$(git log --pretty=format:'- %s (%h) by %an' ${GITHUB_EVENT_BEFORE}..${GITHUB_SHA})
+          fi
+          if [ -z "$(echo "$commits" | tr -d '\n' | tr -d ' ')" ]; then
+            commits_msg="No commit messages available for this release."
+          else
+            commits_msg="$commits"
+          fi
+          full_notes="Test summary: ${test_summary}\n\nCommits included in this pre-release:\n${commits_msg}"
+          echo "notes<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$full_notes" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Create pre-release
         uses: ncipollo/release-action@v1
         with:
-          # use run number + short sha so tags are readable and unique
-          tag: prerelease-${{ steps.vars.outputs.short_sha }}-${{ github.run_number }}
-          name: Pre-release from ${{ github.ref }} (run ${{ github.run_number }})
-          body: |
-            Automated pre-release created from a push to ${{ github.ref }} by ${{ github.actor }}.
+          # use branch + short sha + run number so tags are readable and unique
+          tag: prerelease-${{ steps.vars.outputs.branch }}-${{ steps.vars.outputs.short_sha }}-${{ github.run_number }}
+          name: Pre-release from ${{ steps.vars.outputs.branch }} (run ${{ github.run_number }})
+          body: ${{ steps.notes.outputs.notes }}
           prerelease: true
           # attach the built JAR(s)
-          files: target/*.jar
+          files: downloaded-artifacts/target/*.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
