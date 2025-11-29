@@ -41,26 +41,57 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            // prefer the merge commit sha, fall back to PR head SHA
-            const sha = process.env.MERGE_SHA || context.payload.pull_request.head.sha;
-            core.info(`Looking for Java CI run for SHA: ${sha}`);
-            // list recent workflow runs for the repo and find one with matching sha and name 'Java CI'
+            const preferSha = process.env.MERGE_SHA || context.payload.pull_request.head.sha;
+            core.info(`Looking for Java CI run for preferred SHA: ${preferSha}`);
+
+            // Fetch recent Java CI runs
             const runsResp = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, per_page: 100 });
-            const runs = runsResp.data.workflow_runs || [];
-            const run = runs.find(r => r.head_sha === sha && r.name === 'Java CI');
-            if (!run) {
-              throw new Error(`No 'Java CI' workflow run found for commit ${sha}`);
+            const runs = (runsResp.data.workflow_runs || []).filter(r => r.name === 'Java CI');
+
+            // helper to check a run for the artifact
+            async function findArtifactInRun(run) {
+              const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id });
+              if (!arts || !arts.data || !arts.data.artifacts) return null;
+              // prefer artifact named 'build-artifacts'
+              const artifact = arts.data.artifacts.find(a => a.name === 'build-artifacts') || arts.data.artifacts[0];
+              return artifact || null;
             }
-            core.info(`Found Java CI run id=${run.id} status=${run.conclusion}`);
-            // get artifacts for that run
-            const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id });
-            const artifact = arts.data.artifacts.find(a => a.name === 'build-artifacts') || arts.data.artifacts[0];
-            if (!artifact) {
-              throw new Error(`No artifacts found for run ${run.id}`);
+
+            // 1) prefer run where head_sha == preferSha
+            let chosen = null;
+            for (const r of runs) {
+              if (r.head_sha === preferSha) {
+                const art = await findArtifactInRun(r);
+                if (art) { chosen = { run: r, artifact: art }; break; }
+              }
             }
-            core.info(`Found artifact: ${artifact.name} (id=${artifact.id})`);
-            // return the archive download url and run id
-            return { archive_url: artifact.archive_download_url, run_id: run.id };
+
+            // 2) fallback to PR head SHA
+            if (!chosen && context.payload.pull_request && context.payload.pull_request.head) {
+              const headSha = context.payload.pull_request.head.sha;
+              for (const r of runs) {
+                if (r.head_sha === headSha) {
+                  const art = await findArtifactInRun(r);
+                  if (art) { chosen = { run: r, artifact: art }; break; }
+                }
+              }
+            }
+
+            // 3) fallback: any recent successful run with artifacts
+            if (!chosen) {
+              for (const r of runs) {
+                if (r.conclusion && r.conclusion !== 'success') continue;
+                const art = await findArtifactInRun(r);
+                if (art) { chosen = { run: r, artifact: art }; break; }
+              }
+            }
+
+            if (!chosen) {
+              throw new Error(`Unable to find build-artifacts in recent Java CI runs for PR #${context.payload.pull_request.number}`);
+            }
+
+            core.info(`Selected run id=${chosen.run.id} head_sha=${chosen.run.head_sha} artifact=${chosen.artifact.name}`);
+            return { archive_url: chosen.artifact.archive_download_url, run_id: chosen.run.id };
         env:
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
 
