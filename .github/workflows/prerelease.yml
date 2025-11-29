@@ -40,10 +40,111 @@ jobs:
           echo "branch=${branch_sanitized}" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts from Java CI run
+        id: download_action
         uses: actions/download-artifact@v6
         with:
           name: build-artifacts
           path: downloaded-artifacts
+        continue-on-error: true
+
+      - name: Set branch-based release tag
+        id: set_release_tag
+        run: |
+          set -euo pipefail
+          # Get head branch and SHA from workflow_run payload
+          head_branch="${{ github.event.workflow_run.head_branch }}"
+          head_sha="${{ github.event.workflow_run.head_sha }}"
+          if [ -z "$head_branch" ]; then
+            echo "Error: unable to determine head branch from workflow_run" >&2
+            exit 1
+          fi
+          sanitized=${head_branch//\//-}
+          tag="branch-${sanitized}"
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "release_commit=${head_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Create/force-update git tag for branch
+        if: ${{ always() && steps.set_release_tag.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          tag="${{ steps.set_release_tag.outputs.release_tag }}"
+          commit="${{ steps.set_release_tag.outputs.release_commit }}"
+          git tag -f "$tag" "$commit"
+          git push -f origin "refs/tags/$tag"
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+
+      - name: Delete existing release for branch tag (if any)
+        if: ${{ always() && steps.set_release_tag.outputs.release_tag }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.RELEASE_TAG;
+            try {
+              const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              core.info(`Found existing release id=${rel.data.id} for tag=${tag}, deleting it`);
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: rel.data.id });
+            } catch (err) {
+              if (err.status === 404) {
+                core.info(`No existing release for tag=${tag}`);
+              } else {
+                throw err;
+              }
+            }
+        env:
+          RELEASE_TAG: ${{ steps.set_release_tag.outputs.release_tag }}
+
+      - id: check_download
+        name: Check downloaded artifacts
+        run: |
+          set -euo pipefail
+          if [ -n "$(ls downloaded-artifacts/target/*.jar 2>/dev/null)" ]; then
+            echo "downloaded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "downloaded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: fallback_identify
+        name: Fallback: locate artifact via GitHub API
+        if: ${{ steps.check_download.outputs.downloaded == 'false' }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const run = context.payload.workflow_run;
+            const runId = run.id;
+            core.info(`Looking for artifacts on Java CI run id=${runId}`);
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: runId });
+            if (!arts || !arts.data || !arts.data.artifacts || arts.data.artifacts.length === 0) {
+              throw new Error(`No artifacts found for Java CI run ${runId}`);
+            }
+            const artifact = arts.data.artifacts.find(a => a.name === 'build-artifacts') || arts.data.artifacts[0];
+            core.info(`Selected artifact ${artifact.name} (id=${artifact.id})`);
+            return { archive_url: artifact.archive_download_url };
+
+      - name: Fallback download and extract artifact
+        if: ${{ steps.check_download.outputs.downloaded == 'false' }}
+        run: |
+          set -euo pipefail
+          ARCHIVE_JSON="${{ steps.fallback_identify.outputs.result }}"
+          echo "$ARCHIVE_JSON" > /tmp/art.json
+          archive_url=$(jq -r '.archive_url' /tmp/art.json)
+          if [ -z "$archive_url" ] || [ "$archive_url" = "null" ]; then
+            echo "No archive_url found in previous step output" >&2
+            cat /tmp/art.json >&2 || true
+            exit 1
+          fi
+          mkdir -p downloaded-artifacts
+          echo "Downloading artifact from: $archive_url"
+          curl -L -H "Authorization: Bearer $GITHUB_TOKEN" -o /tmp/artifact.zip "$archive_url"
+          unzip -o /tmp/artifact.zip -d downloaded-artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: List downloaded artifacts
         run: |
@@ -105,14 +206,73 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Create pre-release
-        uses: ncipollo/release-action@v1
+        uses: actions/github-script@v8
         with:
-          # use branch + short sha + run number so tags are readable and unique
-          tag: prerelease-${{ steps.vars.outputs.branch }}-${{ steps.vars.outputs.short_sha }}-${{ github.run_number }}
-          name: Pre-release from ${{ steps.vars.outputs.branch }} (run ${{ github.run_number }})
-          body: ${{ steps.notes.outputs.notes }}
-          prerelease: true
-          # attach the built JAR(s)
-          files: downloaded-artifacts/target/*.jar
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.RELEASE_TAG;
+            const body = process.env.RELEASE_NOTES || '';
+            const isDraft = false;
+            const preRelease = true;
+            let id = 0;
+            try {
+              const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              id = rel.data.id;
+              core.info(`Found existing release id=${id} for tag=${tag}`);
+              // Update release notes if they differ from the current notes
+              if (rel.data.body !== body) {
+                core.info(`Updating release notes for id=${id}`);
+                await github.rest.repos.updateRelease({
+                  owner,
+                  repo,
+                  release_id: id,
+                  tag_name: tag,
+                  name: tag,
+                  body,
+                  draft: isDraft,
+                  prerelease: preRelease
+                });
+              } else {
+                core.info(`Release notes are identical, skipping update for id=${id}`);
+              }
+            } catch (err) {
+              if (err.status === 404) {
+                core.info(`Release not found, creating new release for tag=${tag}`);
+                const rel = await github.rest.repos.createRelease({
+                  owner,
+                  repo,
+                  tag_name: tag,
+                  name: tag,
+                  body,
+                  draft: isDraft,
+                  prerelease: preRelease
+                });
+                id = rel.data.id;
+              } else {
+                throw err;
+              }
+            }
+            // Upload JAR files to the release
+            const jarFiles = fs.readdirSync('downloaded-artifacts/target').filter(f => f.endsWith('.jar'));
+            for (const file of jarFiles) {
+              const filePath = path.join('downloaded-artifacts/target', file);
+              core.info(`Uploading JAR file to release: ${file}`);
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id: id,
+                asset_name: file,
+                asset_data: fs.readFileSync(filePath),
+                headers: {
+                  'Content-Type': 'application/java-archive'
+                }
+              });
+            }
+            return { release_id: id };
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.set_release_tag.outputs.release_tag }}
+          RELEASE_NOTES: ${{ steps.notes.outputs.notes }}

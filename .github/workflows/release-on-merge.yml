@@ -39,7 +39,7 @@ jobs:
 
       - id: identify_pr_and_artifact
         name: Ensure this run corresponds to a merged PR into main and return artifact
-        uses: actions/github-script@v5
+        uses: actions/github-script@v8
         with:
           script: |
             const owner = context.repo.owner;
@@ -78,7 +78,41 @@ jobs:
             }
             const artifact = arts.data.artifacts.find(a => a.name === 'build-artifacts') || arts.data.artifacts[0];
             core.info(`Selected artifact ${artifact.name} (id=${artifact.id}) from run ${runId}`);
-            return { archive_url: artifact.archive_download_url, run_id: runId, pr_number: mergedPr.number, pr_user_login: mergedPr.user.login };
+            // return PR head ref and head SHA so we can create a branch-based tag
+            const pr_head_ref = mergedPr.head.ref;
+            const pr_head_sha = mergedPr.head.sha;
+            return { archive_url: artifact.archive_download_url, run_id: runId, pr_number: mergedPr.number, pr_user_login: mergedPr.user.login, pr_head_ref, pr_head_sha };
+
+      - name: Set release tag and commit for branch
+        id: set_release_tag
+        run: |
+          set -euo pipefail
+          ARCHIVE_JSON="${{ steps.identify_pr_and_artifact.outputs.result }}"
+          skip=$(echo "$ARCHIVE_JSON" | jq -r '.skip // empty') || true
+          if [ "$skip" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pr_head_ref=$(echo "$ARCHIVE_JSON" | jq -r '.pr_head_ref')
+          pr_head_sha=$(echo "$ARCHIVE_JSON" | jq -r '.pr_head_sha')
+          sanitized=${pr_head_ref//\//-}
+          tag="branch-${sanitized}"
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "release_commit=${pr_head_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Create/force-update git tag for branch
+        if: ${{ steps.set_release_tag.outputs.skip != 'true' }}
+        run: |
+          set -euo pipefail
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          tag="${{ steps.set_release_tag.outputs.release_tag }}"
+          commit="${{ steps.set_release_tag.outputs.release_commit }}"
+          # create/update tag locally and force-push to origin
+          git tag -f "$tag" "$commit"
+          git push -f origin "refs/tags/$tag"
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
 
       - name: Download and extract Java CI artifact
         run: |
@@ -103,29 +137,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: determine_tag
-        name: Determine tag name from POM or fallback
-        run: |
-          set -euo pipefail
-          version="$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.1.0:exec || true)"
-          echo "POM version: ${version}"
-          if [ -n "$version" ] && [[ "$version" != *SNAPSHOT* ]]; then
-            tag="v${version}"
-          elif [ -n "$version" ]; then
-            release_version="${version%-SNAPSHOT}"
-            tag="v${release_version}-${GITHUB_RUN_NUMBER}"
-          else
-            tag="v$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
-          fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-
-      - name: Create and push tag
-        run: |
-          set -euo pipefail
-          git config user.name "${GITHUB_ACTOR}"
-          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
-          git tag -a "${{ steps.determine_tag.outputs.tag }}" -m "Release ${{ steps.determine_tag.outputs.tag }}"
-          git push origin "${{ steps.determine_tag.outputs.tag }}"
+      # NOTE: We intentionally use the branch-based tag created earlier (release_tag) as the single-release identifier.
+      # The tag has already been created/force-updated and any existing release for that tag deleted above.
 
       - name: Configure Maven settings for GitHub Packages
         run: |
@@ -159,14 +172,77 @@ jobs:
           done
 
       - name: Create official release
-        uses: ncipollo/release-action@v1
+        uses: actions/github-script@v8
         with:
-          tag: ${{ steps.determine_tag.outputs.tag }}
-          name: Release ${{ steps.determine_tag.outputs.tag }}
-          body: |
-            Official release created from merged PR #${{ fromJSON(steps.identify_pr_and_artifact.outputs.result).pr_number }} by ${{ fromJSON(steps.identify_pr_and_artifact.outputs.result).pr_user_login }}.
-            Artifacts were pulled from the successful Java CI run for the merge commit.
-          prerelease: false
-          files: downloaded-artifacts/target/*.jar
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.RELEASE_TAG;
+            const identify = JSON.parse(process.env.IDENTIFY_RESULT || '{}');
+            const pr_number = identify.pr_number;
+            const pr_user = identify.pr_user_login || '';
+            const pr_head_ref = identify.pr_head_ref || '';
+            const body = `Official release created from merged PR #${pr_number} by ${pr_user}.\nBranch-based single release for branch ${pr_head_ref} (this release will overwrite previous release for the branch).`;
+
+            // Get or create release by tag
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              core.info(`Found existing release id=${release.data.id} for tag=${tag}`);
+              // update release metadata
+              await github.rest.repos.updateRelease({ owner, repo, release_id: release.data.id, tag_name: tag, name: `Release ${tag}`, body, prerelease: false });
+            } catch (err) {
+              if (err.status === 404) {
+                core.info(`No existing release for tag=${tag}, creating one`);
+                release = await github.rest.repos.createRelease({ owner, repo, tag_name: tag, name: `Release ${tag}`, body, prerelease: false });
+              } else {
+                throw err;
+              }
+            }
+
+            // Upload assets from downloaded-artifacts/target/*.jar
+            const artifactsDir = path.join(process.cwd(), 'downloaded-artifacts', 'target');
+            if (fs.existsSync(artifactsDir)) {
+              const files = fs.readdirSync(artifactsDir).filter(f => f.endsWith('.jar'));
+              for (const f of files) {
+                const filePath = path.join(artifactsDir, f);
+                const stats = fs.statSync(filePath);
+                core.info(`Uploading asset ${f} (size=${stats.size}) to release ${release.data.id}`);
+                const upload = await github.rest.repos.uploadReleaseAsset({
+                  owner,
+                  repo,
+                  release_id: release.data.id,
+                  name: f,
+                  data: fs.readFileSync(filePath),
+                  headers: { 'content-type': 'application/java-archive', 'content-length': stats.size }
+                });
+                core.info(`Uploaded asset: ${upload.data.browser_download_url}`);
+              }
+            } else {
+              core.info(`No artifacts directory found at ${artifactsDir}`);
+            }
+
+            // Add label to the merged PR (create label if missing)
+            if (pr_number) {
+              const sanitized = (pr_head_ref || 'branch').replace(/\//g, '-');
+              const labelName = `released:${sanitized}`;
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name: labelName });
+                core.info(`Label ${labelName} exists`);
+              } catch (e) {
+                if (e.status === 404) {
+                  core.info(`Creating label ${labelName}`);
+                  await github.rest.issues.createLabel({ owner, repo, name: labelName, color: '0E8A16', description: 'Automatically created release label' });
+                } else {
+                  throw e;
+                }
+              }
+              core.info(`Adding label ${labelName} to PR #${pr_number}`);
+              await github.rest.issues.addLabels({ owner, repo, issue_number: pr_number, labels: [labelName] });
+            }
+            return { release_id: release.data.id };
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.set_release_tag.outputs.release_tag }}
+          IDENTIFY_RESULT: ${{ steps.identify_pr_and_artifact.outputs.result }}
