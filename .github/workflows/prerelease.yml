@@ -109,7 +109,7 @@ jobs:
         continue-on-error: true
 
       - id: fallback_identify
-        name: Fallback: locate artifact via GitHub API
+        name: Fallback locate artifact via GitHub API
         if: ${{ steps.check_download.outputs.downloaded == 'false' }}
         uses: actions/github-script@v8
         with:
