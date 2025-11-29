@@ -40,7 +40,7 @@ jobs:
           echo "branch=${branch_sanitized}" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts from Java CI run
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v6
         with:
           name: build-artifacts
           path: downloaded-artifacts
