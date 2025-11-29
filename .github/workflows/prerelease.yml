@@ -99,10 +99,7 @@ jobs:
           else
             commits_msg="$commits"
           fi
-          full_notes="**Test summary:** ${test_summary}
-
-**Commits:**
-${commits_msg}"
+          full_notes="Test summary: ${test_summary}\n\nCommits included in this pre-release:\n${commits_msg}"
           echo "notes<<EOF" >> "$GITHUB_OUTPUT"
           echo "$full_notes" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
